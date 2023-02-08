@@ -25,6 +25,11 @@ from .models import DeleteStrategy, PostprocessorStatus
 from .remux import RemuxingProgress, RemuxingResult, remux_video
 from .typing import Progress
 
+from bcut_asr import BcutASR, APIError
+from bcut_asr.orm import ResultStateEnum
+import time
+import ffmpeg
+
 __all__ = (
     'Postprocessor',
     'PostprocessorEventListener',
@@ -186,6 +191,7 @@ class Postprocessor(
                         result_path = video_path
 
                     self._completed_files.append(result_path)
+                    await self._gen_video_subtitle(result_path)
                     await self._emit(
                         'video_postprocessing_completed', self, result_path
                     )
@@ -342,3 +348,136 @@ class Postprocessor(
                 await asyncio.sleep(1)
         else:
             logger.warning(f'No such metadata file: {path}')
+
+    async def _gen_video_subtitle(self, video_path: str) -> None:
+        loop = asyncio.get_running_loop()
+
+        OFFSET_DURATION = int(60 * 60 * 2)
+
+        def ffmpeg_render(media_file: str, offset_start=-1) -> bytes:
+            '提取视频伴音并转码为aac格式'
+            media_info = ffmpeg.probe(media_file)
+            if offset_start != -1:
+                for stream in media_info['streams']:
+                    if stream['codec_type'] == 'audio':
+                        if stream['codec_name'] == 'aac':
+                            out, err = (ffmpeg
+                                        .input(media_file, v='warning')
+                                        .output('pipe:', ss = offset_start, t = OFFSET_DURATION, acodec='copy', ac=1, format='adts')
+                                        .run(capture_stdout=True)
+                                        )
+                        else:
+                            out, err = (ffmpeg
+                                        .input(media_file, v='warning')
+                                        .output('pipe:', ss = offset_start, t = OFFSET_DURATION, acodec='copy', ac=1, format='adts')
+                                        .run(capture_stdout=True)
+                                        )
+                        break
+            else:
+                for stream in media_info['streams']:
+                    if stream['codec_type'] == 'audio':
+                        if stream['codec_name'] == 'aac':
+                            out, err = (ffmpeg
+                                        .input(media_file, v='warning')
+                                        .output('pipe:', acodec='copy', ac=1, format='adts')
+                                        .run(capture_stdout=True)
+                                        )
+                        else:
+                            out, err = (ffmpeg
+                                        .input(media_file, v='warning')
+                                        .output('pipe:', ac=1, format='adts')
+                                        .run(capture_stdout=True)
+                                        )
+                        break
+            return out
+
+        def get_media_duration(media_file: str) -> int:
+            '获取媒体文件的时长'
+            media_info = ffmpeg.probe(media_file)
+            duration = media_info['format']['duration']
+            return int(duration.split('.')[0])
+
+
+        # 处理输入文件情况
+        infile_name = video_path
+
+        # 处理输出文件情况
+        outfile_fmt = 'srt'
+        outfile_name = f"{infile_name.rsplit('.', 1)[-2]}.{outfile_fmt}"
+        outfile = open(outfile_name, 'w', encoding='utf8')
+
+
+
+        # ffmpeg分离视频伴音
+        media_duration = get_media_duration(infile_name)
+        logging.info('非标准音频文件, 尝试调用ffmpeg转码')
+        result_list = []
+        if media_duration > OFFSET_DURATION:
+            logging.info(f'媒体时长过长，采取分段上传')
+
+        for i in range((media_duration + OFFSET_DURATION - 1) // OFFSET_DURATION):
+            logging.info(f'当前上传第 {i + 1} 段')
+            try:
+                infile_data = ffmpeg_render(infile_name, OFFSET_DURATION * i)
+            except ffmpeg.Error:
+                logging.error('ffmpeg转码失败')
+            else:
+                logging.info('ffmpeg转码完成')
+                infile_fmt = 'aac'
+
+            # 开始执行转换逻辑
+            asr = BcutASR()
+            asr.set_data(raw_data=infile_data, data_fmt=infile_fmt)
+            try:
+                # 上传文件
+                asr.upload()
+                # 创建任务
+                task_id = asr.create_task()
+                while True:
+                    # 轮询检查任务状态
+                    try:
+                        task_resp = asr.result()
+                        match task_resp.state:
+                            case ResultStateEnum.STOP:
+                                logging.info(f'等待识别开始')
+                            case ResultStateEnum.RUNING:
+                                logging.info(f'识别中-{task_resp.remark}')
+                            case ResultStateEnum.ERROR:
+                                logging.error(f'识别失败-{task_resp.remark}')
+                                break
+                            case ResultStateEnum.COMPLETE:
+                                logging.info(f'识别成功')
+                                # 识别成功, 回读字幕数据
+                                result_part = task_resp.parse()
+                                # result_part.adjust_timestamp_offset(i*OFFSET_DURATION)
+                                # 调整字幕 offset
+                                for item in result_part.utterances:
+                                    item.start_time += i * OFFSET_DURATION * 1000
+                                    item.end_time += i * OFFSET_DURATION * 1000
+
+                                result_list.append(result_part)
+                                break
+                        time.sleep(5.0)
+                    except Exception as e:
+                        print(e)
+                        time.sleep(5.0)
+                
+            except APIError as err:
+                logging.error(f'接口错误: {err.__str__()}')
+        result = result_list[0]
+        for item in result_list[1:]:
+            result.utterances.extend(item.utterances)
+
+
+        if not result.has_data():
+            logging.error('{video_path}未识别到语音')
+        match outfile_fmt:
+            case 'srt':
+                outfile.write(result.to_srt())
+            case 'lrc':
+                outfile.write(result.to_lrc())
+            case 'json':
+                outfile.write(result.json())
+            case 'txt':
+                outfile.write(result.to_txt())
+        logging.info(f'转换成功: {outfile_name}')
